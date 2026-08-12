@@ -1,0 +1,6 @@
+{
+  "27d2a9d0-a126-4fe1-a866-7de40998590a": {
+    "reason": "missing/private packages detected: voicemode-mcp-launcher",
+    "status": "warning"
+  }
+}

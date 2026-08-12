@@ -1,0 +1,151 @@
+name: Publish to PyPI and MCP Registry
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Publish target'
+        required: true
+        default: 'testpypi'
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for trusted publishing and OIDC
+      contents: read
+    
+    steps:
+    - uses: actions/checkout@v7
+    
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+    
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+    
+    - name: Build voice-mode package
+      run: python -m build
+
+    - name: Check voice-mode package
+      run: twine check dist/*
+
+    - name: Build voice-mode-install package
+      run: |
+        cd installer
+        python -m build
+
+    - name: Check voice-mode-install package
+      run: twine check installer/dist/*
+    
+    - name: Publish voice-mode to TestPyPI
+      if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+      run: twine upload --skip-existing --repository testpypi dist/*
+
+    - name: Publish voice-mode-install to TestPyPI
+      if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+      run: twine upload --skip-existing --repository testpypi installer/dist/*
+    
+    - name: Publish voice-mode to PyPI
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true  # re-runs / backfills must not fail on an already-published version (VM-1661)
+
+    - name: Publish voice-mode-install to PyPI
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: installer/dist/
+        skip-existing: true  # re-runs / backfills must not fail on an already-published version (VM-1661)
+    
+    # MCP Registry Publishing Steps
+    - name: Wait for PyPI availability
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      run: |
+        echo "Waiting for package to be available on PyPI..."
+        sleep 30  # Give PyPI time to index the new package
+    
+    - name: Install Go
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      continue-on-error: true  # MCP-registry tail is best-effort — never fail a PyPI release (VM-1661)
+      uses: actions/setup-go@v6
+      with:
+        go-version: 'stable'
+
+    - name: Install MCP Publisher
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      continue-on-error: true  # MCP-registry tail is best-effort — never fail a PyPI release (VM-1661)
+      # actions/setup-go pins GOTOOLCHAIN=local, which blocks Go from fetching a
+      # newer toolchain. The upstream registry's go.mod requires a newer Go than
+      # the runner ships (broke v8.8.0: needed >= 1.26, runner had 1.23) — set
+      # GOTOOLCHAIN=auto so `make publisher` downloads whatever go.mod demands,
+      # self-healing across future upstream bumps (VM-1655).
+      env:
+        GOTOOLCHAIN: auto
+        # Pin the publisher to a known-good upstream release so its build layout /
+        # output path / schema can't move under us mid-release (VM-1661). Bump deliberately.
+        MCP_PUBLISHER_REF: v1.7.9
+      run: |
+        # Build publisher from a PINNED upstream tag (not the moving default branch).
+        git clone --depth 1 --branch "$MCP_PUBLISHER_REF" \
+          https://github.com/modelcontextprotocol/registry publisher-repo
+        cd publisher-repo
+        make publisher
+        # Locate the built binary ROBUSTLY — upstream moved it between
+        # cmd/publisher/bin/ and repo-root bin/ (the v8.9.0 break). Find, don't assume.
+        bin_path="$(find . -type f -name mcp-publisher -path '*bin*' | head -1)"
+        if [ -z "$bin_path" ]; then echo "::error::mcp-publisher binary not found after build"; exit 1; fi
+        cp "$bin_path" ../mcp-publisher
+        cd ..
+        chmod +x mcp-publisher
+    
+    - name: Authenticate with MCP Registry (DNS)
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      continue-on-error: true  # MCP-registry tail is best-effort — never fail a PyPI release (VM-1661)
+      env:
+        MCP_DNS_PRIVATE_KEY: ${{ secrets.MCP_DNS_PRIVATE_KEY }}
+      run: |
+        # Namespace dev.voicemode/* is verified by a TXT record at the APEX of
+        # voicemode.dev: "v=MCPv1; k=ed25519; p=<pubkey>" (VM-1661). MCP_DNS_PRIVATE_KEY
+        # is the hex ed25519 seed matching that record.
+        ./mcp-publisher login dns -domain voicemode.dev -private-key $MCP_DNS_PRIVATE_KEY
+    
+    # Alternative: Use GitHub OIDC authentication (simpler, no secrets needed)
+    # - name: Authenticate with MCP Registry (GitHub OIDC)
+    #   if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    #   run: |
+    #     ./mcp-publisher login github-oidc
+    
+    - name: Publish to MCP Registry
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      continue-on-error: true  # MCP-registry tail is best-effort — never fail a PyPI release (VM-1661)
+      run: |
+        ./mcp-publisher publish
+        echo "✅ Successfully published to MCP Registry"
+    
+    - name: Verify MCP Registry Publication
+      if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+      continue-on-error: true  # MCP-registry tail is best-effort — never fail a PyPI release (VM-1661)
+      run: |
+        echo "Verifying publication..."
+        # Use the v0 REST API (the old /servers/<name> path 404s). search returns
+        # our record once dev.voicemode/voicemode is live.
+        curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=voicemode&version=latest" | jq '.'
